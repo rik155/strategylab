@@ -16,6 +16,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 SCANNER_ENABLED = os.getenv('SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no')
 SCAN_INTERVAL_MINUTES = max(60, int(os.getenv('SCAN_INTERVAL_MINUTES', '60')))
+SCAN_DELAY_SECONDS = max(8, int(os.getenv('SCAN_DELAY_SECONDS', '9')))
 ALERT_MIN_SCORE = float(os.getenv('ALERT_MIN_SCORE', '70'))
 BASE = 'https://api.twelvedata.com'
 AV_BASE = 'https://www.alphavantage.co/query'
@@ -28,7 +29,11 @@ PRESETS = {
     'growth': ['NVDA','AMD','PLTR','SOUN','TSLA','CRWD','PANW','SNOW','NET','DDOG','SHOP','COIN','HOOD','RBLX','U','RKLB','IONQ','RIVN','SMCI','ARM'],
     'europe': ['ASML','SAP','SIEGY','NVO','AZN','UL','SHEL','BP','GSK','DEO','ING','SAN','UBS','NVS','ERIC','NOK']
 }
-scanner_state = {'running': False, 'last_scan': None, 'last_error': None, 'checked': 0, 'matches': [], 'next_scan': None, 'current_symbol': None}
+scanner_state = {
+    'running': False, 'last_scan': None, 'last_error': None,
+    'checked': 0, 'succeeded': 0, 'failed': 0, 'total': 0,
+    'matches': [], 'errors': [], 'next_scan': None, 'current_symbol': None
+}
 alert_history = {}
 config_lock = threading.Lock()
 
@@ -63,18 +68,46 @@ def save_config(cfg):
 def watchlist(): return load_config()['watchlist']
 
 
-def td_get(path, params):
+def is_rate_limit_message(data):
+    if not isinstance(data, dict): return False
+    text = ' '.join(str(data.get(k,'')) for k in ('message','detail','Information','Note','status')).lower()
+    return any(x in text for x in ('rate limit','api credits','credits','too many','limit reached','per minute'))
+
+
+def td_get(path, params, retries=6):
     if not API_KEY: raise RuntimeError('TWELVE_DATA_API_KEY ontbreekt op de server.')
     params = dict(params); params['apikey'] = API_KEY
-    r = requests.get(BASE + path, params=params, timeout=20); r.raise_for_status(); data = r.json()
-    if isinstance(data, dict) and data.get('status') == 'error': raise RuntimeError(data.get('message', 'Twelve Data fout'))
-    return data
+    last_error = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(BASE + path, params=params, timeout=25)
+            if r.status_code == 429:
+                raise RuntimeError('Twelve Data rate limit bereikt')
+            r.raise_for_status(); data = r.json()
+            if isinstance(data, dict) and data.get('status') == 'error':
+                msg = data.get('message','Twelve Data fout')
+                if is_rate_limit_message(data): raise RuntimeError(msg)
+                raise RuntimeError(msg)
+            if is_rate_limit_message(data): raise RuntimeError('Twelve Data rate limit bereikt')
+            return data
+        except Exception as e:
+            last_error = e
+            text = str(e).lower()
+            rate_limited = any(x in text for x in ('rate limit','credit','too many','429','per minute'))
+            if not rate_limited or attempt == retries - 1: break
+            wait = min(70, 12 * (attempt + 1))
+            scanner_state['last_error'] = f'API-limiet bereikt; automatisch {wait}s wachten en daarna verder.'
+            time.sleep(wait)
+    raise RuntimeError(str(last_error or 'Twelve Data fout'))
 
 
 def news_for(symbol):
     if not NEWS_API_KEY: return {'available':False,'score':50,'label':'Niet gekoppeld','items':[],'message':'Nieuws-API niet gekoppeld.'}
     try:
-        r=requests.get(AV_BASE,params={'function':'NEWS_SENTIMENT','tickers':symbol,'limit':20,'sort':'LATEST','apikey':NEWS_API_KEY},timeout=20); r.raise_for_status(); data=r.json(); feed=data.get('feed',[])[:12]; items=[]; scores=[]
+        r=requests.get(AV_BASE,params={'function':'NEWS_SENTIMENT','tickers':symbol,'limit':20,'sort':'LATEST','apikey':NEWS_API_KEY},timeout=20); r.raise_for_status(); data=r.json()
+        if data.get('Information') or data.get('Note'):
+            return {'available':False,'score':50,'label':'Tijdelijk limiet','items':[],'message':data.get('Information') or data.get('Note')}
+        feed=data.get('feed',[])[:12]; items=[]; scores=[]
         for item in feed:
             ticker_score=None
             for ts in item.get('ticker_sentiment',[]):
@@ -156,17 +189,32 @@ def exit_plan(df,total_score,best_strategy):
     else:action='AANHOUDEN / MONITOREN'
     return {'current':round(price,4),'stop_loss':round(stop,4),'take_profit_1':round(tp1,4),'take_profit_2':round(tp2,4),'risk_pct':round((price-stop)/price*100,2),'reward1_pct':round((tp1-price)/price*100,2),'reward2_pct':round((tp2-price)/price*100,2),'rr1':round((tp1-price)/risk,2),'rr2':round((tp2-price)/risk,2),'action':action}
 
-def compute_full_analysis(symbol,include_news=True):
-    series=td_get('/time_series',{'symbol':symbol,'interval':'1day','outputsize':1200,'order':'ASC'});quote=td_get('/quote',{'symbol':symbol});df=to_df(series.get('values',[]))
+
+def analyze_df(symbol, df, include_news=True, market_score=50, quote=None):
     if len(df)<120:raise RuntimeError('Te weinig historische data voor een robuuste analyse.')
     cut=max(80,int(len(df)*0.70));train=df.iloc[:cut].copy();test=df.iloc[cut:].copy();rows=[]
     for s in STRATEGIES:
         train_bt=backtest(train,s);test_bt=backtest(test,s);robust=round(0.35*strategy_rank(train_bt)+0.65*strategy_rank(test_bt),1);rows.append({'strategy':s,'score':robust,'train':train_bt,'test':test_bt})
-    rows.sort(key=lambda x:x['score'],reverse=True);best=rows[0];tech,tech_reasons=technical_score(df);news=news_for(symbol) if include_news else {'available':False,'score':50,'label':'Niet gescand','items':[],'message':''};market_score=50
+    rows.sort(key=lambda x:x['score'],reverse=True);best=rows[0];tech,tech_reasons=technical_score(df);news=news_for(symbol) if include_news else {'available':False,'score':50,'label':'Niet gescand','items':[],'message':''}
+    total=round(0.45*best['score']+0.30*tech+0.15*news['score']+0.10*market_score,1);verdict='POSITIEF' if total>=68 else ('VOORZICHTIG POSITIEF' if total>=58 else ('NEUTRAAL / WACHTEN' if total>=45 else 'NEGATIEF'));plan=exit_plan(df,total,best['strategy'])
+    q=quote or {'symbol':symbol,'close':float(df.iloc[-1].close)}
+    return {'symbol':symbol,'quote':q,'best_strategy':best['strategy'],'strategy_score':best['score'],'technical_score':tech,'technical_reasons':tech_reasons,'news':news,'market_score':market_score,'total_score':total,'verdict':verdict,'strategies':rows,'exit_plan':plan}
+
+
+def compute_full_analysis(symbol,include_news=True):
+    series=td_get('/time_series',{'symbol':symbol,'interval':'1day','outputsize':1200,'order':'ASC'});quote=td_get('/quote',{'symbol':symbol});df=to_df(series.get('values',[]));market_score=50
     try:spy=to_df(td_get('/time_series',{'symbol':'SPY','interval':'1day','outputsize':120,'order':'ASC'}).get('values',[]));market_score,_=technical_score(spy)
     except Exception:pass
-    total=round(0.45*best['score']+0.30*tech+0.15*news['score']+0.10*market_score,1);verdict='POSITIEF' if total>=68 else ('VOORZICHTIG POSITIEF' if total>=58 else ('NEUTRAAL / WACHTEN' if total>=45 else 'NEGATIEF'));plan=exit_plan(df,total,best['strategy'])
-    return {'symbol':symbol,'quote':quote,'best_strategy':best['strategy'],'strategy_score':best['score'],'technical_score':tech,'technical_reasons':tech_reasons,'news':news,'market_score':market_score,'total_score':total,'verdict':verdict,'strategies':rows,'exit_plan':plan}
+    return analyze_df(symbol,df,include_news,market_score,quote)
+
+
+def compute_scanner_analysis(symbol, market_score):
+    # Scanner uses only one Twelve Data request per ticker. This is deliberate so a
+    # complete watchlist can finish even on lower API tiers.
+    series=td_get('/time_series',{'symbol':symbol,'interval':'1day','outputsize':1200,'order':'ASC'})
+    df=to_df(series.get('values',[]))
+    return analyze_df(symbol,df,True,market_score,{'symbol':symbol,'close':float(df.iloc[-1].close) if len(df) else None})
+
 
 def is_alert_candidate(a):
     best=a['strategies'][0]['test'];news_score=a['news']['score'] if a['news'].get('available') else 50
@@ -176,25 +224,45 @@ def telegram_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:return False
     r=requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',json={'chat_id':TELEGRAM_CHAT_ID,'text':text,'disable_web_page_preview':True},timeout=20);r.raise_for_status();return True
 
+
 def scan_once(send_alerts=True):
-    scanner_state.update({'running':True,'last_error':None,'checked':0,'matches':[]});matches=[]
+    wl=watchlist()
+    scanner_state.update({'running':True,'last_error':None,'checked':0,'succeeded':0,'failed':0,'total':len(wl),'matches':[],'errors':[],'current_symbol':None})
+    matches=[]
+    market_score=50
     try:
-        for symbol in watchlist():
+        # Broad market is fetched once per complete scan, not once per ticker.
+        try:
+            spy=to_df(td_get('/time_series',{'symbol':'SPY','interval':'1day','outputsize':120,'order':'ASC'}).get('values',[]));market_score,_=technical_score(spy)
+        except Exception as e:
+            scanner_state['last_error']=f'Marktfilter niet beschikbaar: {e}'
+
+        for index,symbol in enumerate(wl, start=1):
             scanner_state['current_symbol']=symbol
+            scanner_state['checked']=index  # counts every ticker attempted, also on an API/data error
             try:
-                a=compute_full_analysis(symbol,include_news=True);scanner_state['checked']+=1
+                a=compute_scanner_analysis(symbol,market_score)
+                scanner_state['succeeded']+=1
                 best=a['strategies'][0]['test'];p=a['exit_plan'];row={'symbol':symbol,'score':a['total_score'],'strategy':a['best_strategy'],'price':p['current'],'target1':p['take_profit_1'],'target2':p['take_profit_2'],'stop':p['stop_loss'],'oos_return':best['total_return'],'oos_trades':best['trades'],'news':a['news']['score'],'candidate':is_alert_candidate(a)};matches.append(row)
                 if row['candidate']:
                     last=alert_history.get(symbol,0);now=time.time()
                     if send_alerts and now-last>12*3600:
                         msg=f'🚨 StrategyLab kans: {symbol}\nScore: {a["total_score"]}/100 | Strategie: {a["best_strategy"].upper()}\nKoers: {p["current"]}\nDoel 1: {p["take_profit_1"]} (+{p["reward1_pct"]}%)\nDoel 2: {p["take_profit_2"]} (+{p["reward2_pct"]}%)\nStop: {p["stop_loss"]} (-{p["risk_pct"]}%)\nOOS: {best["total_return"]}% | {best["trades"]} trades | PF {best["profit_factor"]}\nNieuws: {a["news"]["label"]} ({a["news"]["score"]}/100)\nGeen financieel advies; controleer zelf voor je handelt.'
                         if telegram_send(msg):alert_history[symbol]=now
-                time.sleep(2)
-            except Exception as e:scanner_state['last_error']=f'{symbol}: {e}'
+            except Exception as e:
+                scanner_state['failed']+=1
+                err=f'{symbol}: {e}'
+                scanner_state['last_error']=err
+                scanner_state['errors']=(scanner_state['errors']+[err])[-20:]
+            # Stay under common free-tier request-per-minute limits instead of racing
+            # through the first few symbols and then appearing to stop.
+            if index < len(wl): time.sleep(SCAN_DELAY_SECONDS)
+
         matches.sort(key=lambda x:x['score'],reverse=True);scanner_state['matches']=matches;scanner_state['last_scan']=datetime.now(timezone.utc).isoformat()
     finally:
         scanner_state['running']=False;scanner_state['current_symbol']=None;scanner_state['next_scan']=datetime.fromtimestamp(time.time()+SCAN_INTERVAL_MINUTES*60,timezone.utc).isoformat()
     return matches
+
 
 def scanner_loop():
     time.sleep(20)
@@ -238,7 +306,7 @@ def full_analysis():
     try:return jsonify(compute_full_analysis(symbol,True))
     except Exception as e:return jsonify(error=str(e)),400
 @app.get('/api/scanner/status')
-def scanner_status():return jsonify({**scanner_state,'enabled':SCANNER_ENABLED,'interval_minutes':SCAN_INTERVAL_MINUTES,'min_score':ALERT_MIN_SCORE,'watchlist':watchlist(),'telegram_ready':bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)})
+def scanner_status():return jsonify({**scanner_state,'enabled':SCANNER_ENABLED,'interval_minutes':SCAN_INTERVAL_MINUTES,'scan_delay_seconds':SCAN_DELAY_SECONDS,'min_score':ALERT_MIN_SCORE,'watchlist':watchlist(),'telegram_ready':bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)})
 @app.get('/api/scanner/config')
 def scanner_config():return jsonify({'watchlist':watchlist(),'presets':PRESETS,'min_score':ALERT_MIN_SCORE,'interval_minutes':SCAN_INTERVAL_MINUTES})
 @app.post('/api/scanner/watchlist')
@@ -255,7 +323,7 @@ def scanner_watchlist_update():
 @app.post('/api/scanner/run')
 def scanner_run():
     if scanner_state['running']:return jsonify(ok=False,message='Scanner draait al.'),409
-    threading.Thread(target=scan_once,kwargs={'send_alerts':True},daemon=True).start();return jsonify(ok=True,message='Scanner gestart.')
+    threading.Thread(target=scan_once,kwargs={'send_alerts':True},daemon=True).start();return jsonify(ok=True,message=f'Scanner gestart voor alle {len(watchlist())} aandelen in de watchlist.')
 @app.post('/api/scanner/test-alert')
 def scanner_test_alert():
     try:telegram_send('✅ StrategyLab testmelding werkt.');return jsonify(ok=True)
