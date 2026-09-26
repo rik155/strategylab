@@ -19,6 +19,9 @@ SCANNER_ENABLED = os.getenv('SCANNER_ENABLED', '1').strip().lower() not in ('0',
 SCAN_INTERVAL_MINUTES = max(60, int(os.getenv('SCAN_INTERVAL_MINUTES', '60')))
 SCAN_DELAY_SECONDS = max(8, int(os.getenv('SCAN_DELAY_SECONDS', '9')))
 ALERT_MIN_SCORE = float(os.getenv('ALERT_MIN_SCORE', '70'))
+START_BUDGET_EUR = float(os.getenv('START_BUDGET_EUR', '100'))
+MIN_NET_PROFIT_EUR = float(os.getenv('MIN_NET_PROFIT_EUR', '2'))
+COST_SAFETY_EUR = float(os.getenv('COST_SAFETY_EUR', '1'))
 BASE = 'https://api.twelvedata.com'
 AV_BASE = 'https://www.alphavantage.co/query'
 CONFIG_PATH = os.getenv('SCANNER_CONFIG', '/data/scanner_config.json')
@@ -127,12 +130,26 @@ def technical_score(df):
  return max(0,min(100,score)),reasons
 def exit_plan(df,total_score,best_strategy):
  x=enrich(df);r=x.iloc[-1];price=float(r.close);atr=float(r.atr14) if pd.notna(r.atr14) and r.atr14>0 else price*.025;look=x.tail(60);support=float(look.low.quantile(.15));resistance=float(look.high.quantile(.90));stop=max(support,price-1.6*atr);stop=min(stop,price*.985);risk=max(price-stop,price*.01);tp1=max(price+1.5*risk,resistance if resistance>price else price+1.5*risk);tp2=max(price+2.5*risk,tp1+.8*atr);latest=signals(df,best_strategy).iloc[-1];action='AFBOUWEN / VERKOOPSIGNAAL' if bool(latest.sell) or total_score<40 else ('WACHTEN / STRAKKE STOP' if total_score<55 else ('AANHOUDEN TOT DOELZONE' if total_score>=70 else 'AANHOUDEN / MONITOREN'));return {'current':round(price,4),'stop_loss':round(stop,4),'take_profit_1':round(tp1,4),'take_profit_2':round(tp2,4),'risk_pct':round((price-stop)/price*100,2),'reward1_pct':round((tp1-price)/price*100,2),'reward2_pct':round((tp2-price)/price*100,2),'rr1':round((tp1-price)/risk,2),'rr2':round((tp2-price)/risk,2),'action':action}
+def degiro_budget_check(symbol,plan,quote=None):
+ quote=quote or {};currency=str(quote.get('currency','')).upper();exchange=str(quote.get('exchange','')).lower();s=symbol.upper();is_crypto=('/' in s or s.endswith('-USD') or s.endswith('-EUR') or 'crypto' in exchange)
+ if is_crypto:market='Crypto-ETP';buy_fee=sell_fee=3.0;fx_cost=0.0
+ elif currency=='USD' or any(x in exchange for x in ('nasdaq','nyse','amex')):market='Verenigde Staten';buy_fee=sell_fee=2.0;fx_cost=START_BUDGET_EUR*.005
+ elif any(x in exchange for x in ('amsterdam','brussels','euronext')):market='Nederland/België';buy_fee=sell_fee=3.0;fx_cost=0.0
+ else:market='Europa/overig';buy_fee=sell_fee=4.90;fx_cost=0.0
+ fees=buy_fee+sell_fee+fx_cost+COST_SAFETY_EUR;gross=START_BUDGET_EUR*float(plan['reward1_pct'])/100;net=gross-fees;break_even=fees/START_BUDGET_EUR*100
+ affordable=None;quantity=None
+ if currency=='EUR' and not is_crypto:quantity=max(0,math.floor((START_BUDGET_EUR-buy_fee)/float(plan['current'])));affordable=quantity>=1
+ worth=net>=MIN_NET_PROFIT_EUR and float(plan['reward1_pct'])>=break_even and affordable is not False
+ if affordable is False:reason='Eén heel aandeel past niet binnen €100; DEGIRO heeft geen fracties.'
+ elif net<MIN_NET_PROFIT_EUR:reason=f'Doel 1 levert naar schatting maar €{net:.2f} netto op.'
+ else:reason=f'Bij doel 1 blijft naar schatting €{net:.2f} netto over.'
+ return {'budget_eur':round(START_BUDGET_EUR,2),'market':market,'estimated_costs_eur':round(fees,2),'gross_profit_at_target1_eur':round(gross,2),'net_profit_at_target1_eur':round(net,2),'break_even_pct':round(break_even,2),'minimum_net_profit_eur':round(MIN_NET_PROFIT_EUR,2),'whole_shares':quantity,'affordable':affordable,'worth_it':worth,'label':'WAARD MET €100' if worth else 'NIET WAARD MET €100','reason':reason,'disclaimer':'Schatting: spread, productkosten en actuele wisselkoers kunnen afwijken.'}
 def analyze_df(symbol,df,include_news=True,market_score=50,quote=None):
  if len(df)<120:raise RuntimeError('Te weinig historische data voor een robuuste analyse.')
  cut=max(80,int(len(df)*.70));train=df.iloc[:cut].copy();test=df.iloc[cut:].copy();rows=[]
  for s in STRATEGIES:
   train_bt=backtest(train,s);test_bt=backtest(test,s);rows.append({'strategy':s,'score':round(.35*strategy_rank(train_bt)+.65*strategy_rank(test_bt),1),'train':train_bt,'test':test_bt})
- rows.sort(key=lambda x:x['score'],reverse=True);best=rows[0];tech,reasons=technical_score(df);news=news_for(symbol) if include_news else {'available':False,'score':50,'label':'Niet gescand','items':[],'message':''};total=round(.45*best['score']+.30*tech+.15*news['score']+.10*market_score,1);verdict='POSITIEF' if total>=68 else ('VOORZICHTIG POSITIEF' if total>=58 else ('NEUTRAAL / WACHTEN' if total>=45 else 'NEGATIEF'));return {'symbol':symbol,'quote':quote or {'symbol':symbol,'close':float(df.iloc[-1].close)},'best_strategy':best['strategy'],'strategy_score':best['score'],'technical_score':tech,'technical_reasons':reasons,'news':news,'market_score':market_score,'total_score':total,'verdict':verdict,'strategies':rows,'exit_plan':exit_plan(df,total,best['strategy'])}
+ rows.sort(key=lambda x:x['score'],reverse=True);best=rows[0];tech,reasons=technical_score(df);news=news_for(symbol) if include_news else {'available':False,'score':50,'label':'Niet gescand','items':[],'message':''};total=round(.45*best['score']+.30*tech+.15*news['score']+.10*market_score,1);verdict='POSITIEF' if total>=68 else ('VOORZICHTIG POSITIEF' if total>=58 else ('NEUTRAAL / WACHTEN' if total>=45 else 'NEGATIEF'));q=quote or {'symbol':symbol,'close':float(df.iloc[-1].close)};plan=exit_plan(df,total,best['strategy']);return {'symbol':symbol,'quote':q,'best_strategy':best['strategy'],'strategy_score':best['score'],'technical_score':tech,'technical_reasons':reasons,'news':news,'market_score':market_score,'total_score':total,'verdict':verdict,'strategies':rows,'exit_plan':plan,'budget_check':degiro_budget_check(symbol,plan,q)}
 def compute_full_analysis(symbol,include_news=True):
  series=td_get('/time_series',{'symbol':symbol,'interval':'1day','outputsize':1200,'order':'ASC'});quote=td_get('/quote',{'symbol':symbol});df=to_df(series.get('values',[]));market_score=50
  try:spy=to_df(td_get('/time_series',{'symbol':'SPY','interval':'1day','outputsize':120,'order':'ASC'}).get('values',[]));market_score,_=technical_score(spy)
@@ -141,7 +158,7 @@ def compute_full_analysis(symbol,include_news=True):
 def compute_scanner_analysis(symbol,market_score):
  series=td_get('/time_series',{'symbol':symbol,'interval':'1day','outputsize':1200,'order':'ASC'});df=to_df(series.get('values',[]));return analyze_df(symbol,df,True,market_score,{'symbol':symbol,'close':float(df.iloc[-1].close) if len(df) else None})
 def is_alert_candidate(a):
- best=a['strategies'][0]['test'];news_score=a['news']['score'] if a['news'].get('available') else 50;return a['total_score']>=ALERT_MIN_SCORE and a['technical_score']>=60 and a['market_score']>=50 and news_score>=45 and best['trades']>=6 and best['total_return']>0 and best['profit_factor']>=1.20 and a['exit_plan']['rr1']>=1.4
+ best=a['strategies'][0]['test'];news_score=a['news']['score'] if a['news'].get('available') else 50;return a['budget_check']['worth_it'] and a['total_score']>=ALERT_MIN_SCORE and a['technical_score']>=60 and a['market_score']>=50 and news_score>=45 and best['trades']>=6 and best['total_return']>0 and best['profit_factor']>=1.20 and a['exit_plan']['rr1']>=1.4
 def telegram_send(text):
  if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:return False
  r=requests.post(f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',json={'chat_id':TELEGRAM_CHAT_ID,'text':text,'disable_web_page_preview':True},timeout=20);r.raise_for_status();return True
@@ -153,11 +170,11 @@ def scan_once(send_alerts=True):
   for index,symbol in enumerate(wl,start=1):
    scanner_state['current_symbol']=symbol;scanner_state['checked']=index
    try:
-    a=compute_scanner_analysis(symbol,market_score);scanner_state['succeeded']+=1;best=a['strategies'][0]['test'];p=a['exit_plan'];row={'symbol':symbol,'score':a['total_score'],'strategy':a['best_strategy'],'price':p['current'],'target1':p['take_profit_1'],'target2':p['take_profit_2'],'stop':p['stop_loss'],'oos_return':best['total_return'],'oos_trades':best['trades'],'news':a['news']['score'],'candidate':is_alert_candidate(a)};matches.append(row)
+    a=compute_scanner_analysis(symbol,market_score);scanner_state['succeeded']+=1;best=a['strategies'][0]['test'];p=a['exit_plan'];bc=a['budget_check'];row={'symbol':symbol,'score':a['total_score'],'strategy':a['best_strategy'],'price':p['current'],'target1':p['take_profit_1'],'target2':p['take_profit_2'],'stop':p['stop_loss'],'oos_return':best['total_return'],'oos_trades':best['trades'],'news':a['news']['score'],'budget_label':bc['label'],'net_profit':bc['net_profit_at_target1_eur'],'costs':bc['estimated_costs_eur'],'budget_reason':bc['reason'],'candidate':is_alert_candidate(a)};matches.append(row)
     if row['candidate']:
      last=alert_history.get(symbol,0);now=time.time()
      if send_alerts and now-last>12*3600:
-      msg=f'🚨 StrategyLab kans: {symbol}\nScore: {a["total_score"]}/100 | Strategie: {a["best_strategy"].upper()}\nKoers: {p["current"]}\nDoel 1: {p["take_profit_1"]}\nDoel 2: {p["take_profit_2"]}\nStop: {p["stop_loss"]}\nNieuws: {a["news"]["label"]}';
+      msg=f'🚨 StrategyLab kans: {symbol}\nScore: {a["total_score"]}/100 | Strategie: {a["best_strategy"].upper()}\nBudget: €{bc["budget_eur"]:.0f} | {bc["label"]}\nGeschatte kosten: €{bc["estimated_costs_eur"]:.2f}\nNetto bij doel 1: €{bc["net_profit_at_target1_eur"]:.2f}\nKoers: {p["current"]}\nDoel 1: {p["take_profit_1"]}\nDoel 2: {p["take_profit_2"]}\nStop: {p["stop_loss"]}\nNieuws: {a["news"]["label"]}';
       if telegram_send(msg):alert_history[symbol]=now
    except Exception as e:scanner_state['failed']+=1;err=f'{symbol}: {e}';scanner_state['last_error']=err;scanner_state['errors']=(scanner_state['errors']+[err])[-20:]
    if index<len(wl):time.sleep(SCAN_DELAY_SECONDS)
@@ -205,9 +222,9 @@ def full_analysis():
  try:return jsonify(compute_full_analysis(symbol,True))
  except Exception as e:return jsonify(error=str(e)),400
 @app.get('/api/scanner/status')
-def scanner_status():return jsonify({**scanner_state,'enabled':SCANNER_ENABLED,'interval_minutes':SCAN_INTERVAL_MINUTES,'scan_delay_seconds':SCAN_DELAY_SECONDS,'min_score':ALERT_MIN_SCORE,'watchlist':watchlist(),'telegram_ready':bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)})
+def scanner_status():return jsonify({**scanner_state,'enabled':SCANNER_ENABLED,'interval_minutes':SCAN_INTERVAL_MINUTES,'scan_delay_seconds':SCAN_DELAY_SECONDS,'min_score':ALERT_MIN_SCORE,'budget_eur':START_BUDGET_EUR,'min_net_profit_eur':MIN_NET_PROFIT_EUR,'watchlist':watchlist(),'telegram_ready':bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)})
 @app.get('/api/scanner/config')
-def scanner_config():return jsonify({'watchlist':watchlist(),'presets':PRESETS,'min_score':ALERT_MIN_SCORE,'interval_minutes':SCAN_INTERVAL_MINUTES})
+def scanner_config():return jsonify({'watchlist':watchlist(),'presets':PRESETS,'min_score':ALERT_MIN_SCORE,'budget_eur':START_BUDGET_EUR,'min_net_profit_eur':MIN_NET_PROFIT_EUR,'interval_minutes':SCAN_INTERVAL_MINUTES})
 @app.post('/api/scanner/watchlist')
 def scanner_watchlist_update():
  d=request.get_json(silent=True) or {};action=d.get('action');symbol=str(d.get('symbol','')).strip().upper();cfg=load_config();wl=cfg['watchlist']
