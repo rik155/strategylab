@@ -1,0 +1,18 @@
+services:
+  strategylab:
+    build: .
+    container_name: strategylab
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: 80
+      START_BUDGET_EUR: 100
+      MIN_NET_PROFIT_EUR: 2
+    ports:
+      - "8094:80"
+    volumes:
+      - strategylab_data:/data
+
+volumes:
+  strategylab_data:
