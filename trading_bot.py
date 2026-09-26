@@ -11,7 +11,7 @@ _lock = threading.Lock()
 def _now(): return datetime.now(timezone.utc).isoformat()
 
 def _blank():
-    return {'active':False,'mode':'simulation','broker':'IBKR_PENDING','started_at':None,'ends_at':None,'budget':0.0,'max_loss':0.0,'risk_per_trade_pct':1.0,'cash':0.0,'realized_pnl':0.0,'unrealized_pnl':0.0,'positions':[],'trades':[],'last_action':'Nog geen sessie gestart','emergency_stop':False}
+    return {'active':False,'mode':'simulation','broker':'DEGIRO_MANUAL','started_at':None,'ends_at':None,'budget':100.0,'max_loss':5.0,'risk_per_trade_pct':1.0,'cash':100.0,'realized_pnl':0.0,'unrealized_pnl':0.0,'positions':[],'trades':[],'last_action':'Nog geen sessie gestart','emergency_stop':False}
 
 def load_state():
     with _lock:
@@ -31,7 +31,7 @@ def start_session(budget,hours,max_loss,risk_per_trade_pct=1.0):
     if budget<=0 or hours<=0 or max_loss<=0:raise ValueError('Bedrag, looptijd en maximaal verlies moeten groter dan 0 zijn.')
     if max_loss>=budget:raise ValueError('Maximaal verlies moet lager zijn dan het sessiebudget.')
     if not 0.1<=risk<=5:raise ValueError('Risico per trade moet tussen 0,1% en 5% liggen.')
-    now=time.time();s=_blank();s.update({'active':True,'started_at':_now(),'ends_at':datetime.fromtimestamp(now+hours*3600,timezone.utc).isoformat(),'budget':round(budget,2),'max_loss':round(max_loss,2),'risk_per_trade_pct':risk,'cash':round(budget,2),'last_action':'Trading sessie gestart in simulatiemodus'})
+    now=time.time();s=_blank();s.update({'active':True,'started_at':_now(),'ends_at':datetime.fromtimestamp(now+hours*3600,timezone.utc).isoformat(),'budget':round(budget,2),'max_loss':round(max_loss,2),'risk_per_trade_pct':risk,'cash':round(budget,2),'last_action':'Signaalsessie gestart; orders handmatig in DEGIRO'})
     save_state(s);return s
 
 def stop_session(emergency=False):
@@ -49,8 +49,8 @@ def session_status():
     return s
 
 class BrokerAdapter:
-    """Interface for IBKR. Real order placement stays disabled until credentials/connectivity are configured."""
-    def status(self):return {'connected':False,'name':'IBKR','live_orders_enabled':False,'message':'IBKR nog niet gekoppeld'}
+    """DEGIRO is manual-only: the app never places orders for the user."""
+    def status(self):return {'connected':False,'name':'DEGIRO','live_orders_enabled':False,'message':'Orders altijd handmatig plaatsen'}
     def place_order(self,*args,**kwargs):raise RuntimeError('Live orders zijn nog niet ingeschakeld.')
     def close_position(self,*args,**kwargs):raise RuntimeError('Live orders zijn nog niet ingeschakeld.')
 
