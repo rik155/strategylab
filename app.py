@@ -249,7 +249,7 @@ def trading_status():return jsonify({'session':session_status(),'broker':broker.
 def trading_start():
  d=request.get_json(silent=True) or {}
  try:
-  s=start_session(d.get('budget'),d.get('hours'),d.get('max_loss'),d.get('risk_per_trade_pct',1));telegram_send(f'🤖 StrategyLab sessie gestart\nBudget: €{s["budget"]}\nLooptijd tot: {s["ends_at"]}\nMax verlies: €{s["max_loss"]}\nModus: SIMULATIE — IBKR nog niet gekoppeld');return jsonify(ok=True,session=s,broker=broker.status())
+  s=start_session(d.get('budget'),d.get('hours'),d.get('max_loss'),d.get('risk_per_trade_pct',1));telegram_send(f'🤖 StrategyLab sessie gestart\nBudget: €{s["budget"]}\nLooptijd tot: {s["ends_at"]}\nMax verlies: €{s["max_loss"]}\nModus: SIMULATIE — orders handmatig in DEGIRO');return jsonify(ok=True,session=s,broker=broker.status())
  except Exception as e:return jsonify(ok=False,message=str(e)),400
 @app.post('/api/trading/stop')
 def trading_stop():
